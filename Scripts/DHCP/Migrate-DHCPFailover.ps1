@@ -494,9 +494,150 @@ catch {
 }
 
 # ============================================================================
-# STEP 5 - CREATE THE FAILOVER RELATIONSHIP
+# STEP 5 - CHECK AND SYNC CUSTOM OPTION DEFINITIONS
 # ============================================================================
-Write-Step "5" "CREATING FAILOVER RELATIONSHIP"
+Write-Step "5" "CHECKING CUSTOM OPTION DEFINITIONS"
+
+# Failover cannot replicate scopes that use custom option definitions if those
+# definitions don't exist on the partner server. This causes Error 20010:
+# "The specified option does not exist." The GUI fails per-scope, but the script
+# passes all scopes at once, so one bad scope fails the whole operation.
+# This step detects missing definitions and offers to copy them automatically.
+
+$missingOptDefs = @()
+$optDefCheckCompleted = $false
+
+try {
+    # Get ALL option definitions (standard + custom) from both servers
+    $sourceOptDefs = @(Get-DhcpServerv4OptionDefinition -ComputerName $SourceServer -All -ErrorAction Stop)
+    $partnerOptDefs = @(Get-DhcpServerv4OptionDefinition -ComputerName $PartnerServer -All -ErrorAction Stop)
+
+    # Build a lookup of partner definitions: "OptionId|VendorClass" as key
+    $partnerDefLookup = @{}
+    foreach ($def in $partnerOptDefs) {
+        $key = "$($def.OptionId)|$($def.VendorClass)"
+        $partnerDefLookup[$key] = $true
+    }
+
+    # Find definitions on source that don't exist on partner
+    foreach ($def in $sourceOptDefs) {
+        $key = "$($def.OptionId)|$($def.VendorClass)"
+        if (-not $partnerDefLookup.ContainsKey($key)) {
+            $missingOptDefs += $def
+        }
+    }
+
+    $optDefCheckCompleted = $true
+}
+catch {
+    Write-Warn "Could not compare option definitions: $($_.Exception.Message)"
+    Write-Host "  If failover creation fails with Error 20010, check custom options manually." -ForegroundColor Yellow
+    Write-Host "  On the source server: Right-click IPv4 > Set Predefined Options to view custom options." -ForegroundColor Yellow
+}
+
+if ($optDefCheckCompleted -and $missingOptDefs.Count -gt 0) {
+    Write-Warn "$($missingOptDefs.Count) custom option definition(s) exist on source but NOT on partner:"
+    Write-Host ""
+    foreach ($def in $missingOptDefs) {
+        $vcLabel = if ($def.VendorClass) { " (Vendor: $($def.VendorClass))" } else { "" }
+        Write-Host "    Option $($def.OptionId)  [$($def.Name)]  Type: $($def.Type)$vcLabel" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    Write-Host "  Without these, failover will fail with Error 20010 for any scope" -ForegroundColor Yellow
+    Write-Host "  that uses these options." -ForegroundColor Yellow
+    Write-Host ""
+
+    $syncConfirm = Read-Host "  Copy these definitions to $PartnerServer? (y/n)"
+    if ($syncConfirm -eq 'y') {
+
+        # Before copying option definitions, check if any belong to vendor classes
+        # that don't exist on the partner. Vendor class definitions must exist before
+        # option definitions that reference them can be created.
+        $missingVendorClasses = @($missingOptDefs | Where-Object { $_.VendorClass } | ForEach-Object { $_.VendorClass } | Select-Object -Unique)
+        if ($missingVendorClasses.Count -gt 0) {
+            Write-Host "  Checking vendor class definitions required by these options..." -ForegroundColor White
+            $sourceVendorClasses = @()
+            try {
+                $sourceVendorClasses = @(Get-DhcpServerv4Class -ComputerName $SourceServer -Type Vendor -ErrorAction Stop)
+            }
+            catch { }
+
+            $partnerVcNames = @()
+            try {
+                $partnerVcNames = @(Get-DhcpServerv4Class -ComputerName $PartnerServer -Type Vendor -ErrorAction Stop | ForEach-Object { $_.Name })
+            }
+            catch { }
+
+            foreach ($vcName in $missingVendorClasses) {
+                if ($vcName -notin $partnerVcNames) {
+                    $vcDef = $sourceVendorClasses | Where-Object { $_.Name -eq $vcName }
+                    if ($vcDef) {
+                        try {
+                            Add-DhcpServerv4Class -ComputerName $PartnerServer -Name $vcDef.Name -Type Vendor -Data $vcDef.Data -Description $vcDef.Description -ErrorAction Stop
+                            Write-Success "  Vendor class '$vcName' created on $PartnerServer."
+                        }
+                        catch {
+                            Write-Fail "  Vendor class '$vcName': $($_.Exception.Message)"
+                            Write-Host "    Option definitions for this vendor class will fail." -ForegroundColor Yellow
+                        }
+                    }
+                }
+            }
+        }
+
+        $syncSuccess = 0
+        $syncFailed = 0
+        foreach ($def in $missingOptDefs) {
+            try {
+                $optDefParams = @{
+                    ComputerName = $PartnerServer
+                    OptionId     = $def.OptionId
+                    Name         = $def.Name
+                    Type         = $def.Type
+                    ErrorAction  = "Stop"
+                }
+                if ($def.VendorClass) {
+                    $optDefParams["VendorClass"] = $def.VendorClass
+                }
+                if ($def.MultiValued) {
+                    $optDefParams["MultiValued"] = $true
+                }
+                if ($def.Description) {
+                    $optDefParams["Description"] = $def.Description
+                }
+                if ($def.DefaultValue) {
+                    $optDefParams["DefaultValue"] = $def.DefaultValue
+                }
+                Add-DhcpServerv4OptionDefinition @optDefParams
+                Write-Success "  Option $($def.OptionId) [$($def.Name)] created on $PartnerServer."
+                $syncSuccess++
+            }
+            catch {
+                Write-Fail "  Option $($def.OptionId) [$($def.Name)]: $($_.Exception.Message)"
+                $syncFailed++
+            }
+        }
+        Write-Host ""
+        if ($syncFailed -gt 0) {
+            Write-Fail "$syncFailed definition(s) failed to copy. Failover may fail for affected scopes."
+            Write-Host "  You can create them manually via: IPv4 > Set Predefined Options > Add" -ForegroundColor Yellow
+        }
+        else {
+            Write-Success "All $syncSuccess custom definition(s) copied successfully."
+        }
+    }
+    else {
+        Write-Warn "Skipped. Failover may fail with Error 20010 for scopes using these options."
+    }
+}
+elseif ($optDefCheckCompleted) {
+    Write-Success "All option definitions match between source and partner."
+}
+
+# ============================================================================
+# STEP 6 - CREATE THE FAILOVER RELATIONSHIP
+# ============================================================================
+Write-Step "6" "CREATING FAILOVER RELATIONSHIP"
 
 Write-Host "  Configuration summary:" -ForegroundColor White
 Write-Host "    Source (Active):     $SourceServer" -ForegroundColor White
@@ -588,15 +729,30 @@ try {
     }
 }
 catch {
-    Write-Fail "Failed to create failover relationship: $($_.Exception.Message)"
+    $errorMsg = $_.Exception.Message
+    Write-Fail "Failed to create failover relationship: $errorMsg"
     Write-Host ""
-    Write-Host "  Common causes:" -ForegroundColor Yellow
-    Write-Host "    - TCP port 647 blocked between the two servers" -ForegroundColor Yellow
-    Write-Host "    - Scopes already exist on the partner server" -ForegroundColor Yellow
-    Write-Host "    - Partner server not authorised in AD" -ForegroundColor Yellow
-    Write-Host "    - DNS resolution issues between the servers" -ForegroundColor Yellow
-    Write-Host "    - Shared secret contains special characters that need escaping" -ForegroundColor Yellow
-    Write-Host "    - Time is out of sync between the two servers (Kerberos needs <5 min drift)" -ForegroundColor Yellow
+
+    # Provide targeted guidance based on the specific error
+    if ($errorMsg -match "20010" -or $errorMsg -match "option does not exist") {
+        Write-Host "  ERROR 20010 DETECTED: A scope uses a custom option definition that" -ForegroundColor Red
+        Write-Host "  does not exist on the partner server." -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  To fix: On $PartnerServer, right-click IPv4 > Set Predefined Options > Add" -ForegroundColor Yellow
+        Write-Host "  and create the same custom option that exists on $SourceServer." -ForegroundColor Yellow
+        Write-Host "  Then re-run this script." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "  Common causes:" -ForegroundColor Yellow
+        Write-Host "    - Custom option definitions missing on partner (Error 20010)" -ForegroundColor Yellow
+        Write-Host "    - TCP port 647 blocked between the two servers" -ForegroundColor Yellow
+        Write-Host "    - Scopes already exist on the partner server" -ForegroundColor Yellow
+        Write-Host "    - Partner server not authorised in AD" -ForegroundColor Yellow
+        Write-Host "    - DNS resolution issues between the servers" -ForegroundColor Yellow
+        Write-Host "    - Shared secret contains special characters that need escaping" -ForegroundColor Yellow
+        Write-Host "    - Time is out of sync between the two servers (Kerberos needs <5 min drift)" -ForegroundColor Yellow
+        Write-Host "    - IP addresses used instead of FQDNs (failover requires FQDNs)" -ForegroundColor Yellow
+    }
     Write-Host ""
     if ($backupDir) {
         Write-Host "  Your backup is safe at: $backupDir" -ForegroundColor Green
@@ -605,9 +761,9 @@ catch {
 }
 
 # ============================================================================
-# STEP 6 - VERIFY REPLICATION
+# STEP 7 - VERIFY REPLICATION
 # ============================================================================
-Write-Step "6" "VERIFYING REPLICATION TO $PartnerServer"
+Write-Step "7" "VERIFYING REPLICATION TO $PartnerServer"
 
 # Give it time to replicate. Larger environments need more time.
 $waitSeconds = [Math]::Max(10, [Math]::Min(30, $scopeIds.Count * 3))
@@ -781,7 +937,7 @@ Write-Host "       the network gets no IP address." -ForegroundColor Red
 Write-Host ""
 Write-Host "    7. After breaking failover, stop (don't uninstall) the old" -ForegroundColor Yellow
 Write-Host "       DHCP service as a safety measure:" -ForegroundColor Yellow
-Write-Host "       Stop-Service DHCPServer -ComputerName `"$SourceServer`"" -ForegroundColor Cyan
+Write-Host "       Get-Service -ComputerName `"$SourceServer`" -Name DHCPServer | Stop-Service -Force" -ForegroundColor Cyan
 Write-Host "       Set-Service -Name DHCPServer -StartupType Disabled -ComputerName `"$SourceServer`"" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "    8. Remove $SourceServer from all IP helpers on your" -ForegroundColor Yellow
