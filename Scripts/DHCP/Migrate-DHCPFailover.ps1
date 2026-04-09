@@ -713,17 +713,75 @@ if ($backupDir) {
 Write-Host "    - Failover relationship '$FailoverName' created ($FailoverMode mode)" -ForegroundColor White
 Write-Host "    - $($scopeIds.Count) scope(s) replicating to $PartnerServer" -ForegroundColor White
 Write-Host ""
-Write-Host "  What you need to do next:" -ForegroundColor Yellow
-Write-Host "    1. Verify scopes and reservations in the DHCP console on $PartnerServer" -ForegroundColor Yellow
-Write-Host "    2. Set any server-level options listed above on $PartnerServer manually" -ForegroundColor Yellow
-Write-Host "    3. Check DNS dynamic update credentials (IPv4 > Properties > DNS tab > Advanced > Credentials)" -ForegroundColor Yellow
-Write-Host "    4. Update IP helpers on your firewalls/switches to include $PartnerServer" -ForegroundColor Yellow
-Write-Host "    5. Let both servers run side-by-side for a day or two (soak period)" -ForegroundColor Yellow
-Write-Host "    6. When ready to cut over, run on the NEW server:" -ForegroundColor Yellow
-Write-Host "       Remove-DhcpServerv4Failover -Name `"$FailoverName`"" -ForegroundColor Cyan
-Write-Host "       (Scopes stay on whichever server runs this command)" -ForegroundColor Yellow
-Write-Host "    7. Remove old server from IP helpers and decommission" -ForegroundColor Yellow
+Write-Host "  ============================================================" -ForegroundColor Yellow
+Write-Host "  WHAT YOU NEED TO DO NEXT (read carefully)" -ForegroundColor Yellow
+Write-Host "  ============================================================" -ForegroundColor Yellow
 Write-Host ""
-Write-Host "  To force a manual replication sync at any time:" -ForegroundColor White
+Write-Host "  PHASE 1: VERIFY AND PREPARE (do this now)" -ForegroundColor White
+Write-Host ""
+Write-Host "    1. Run the Verify-DHCPReplication.ps1 script to confirm all scopes," -ForegroundColor Yellow
+Write-Host "       leases, reservations, and options replicated correctly." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "    2. Set any server-level options on $PartnerServer manually." -ForegroundColor Yellow
+Write-Host "       Server-level options do NOT replicate via failover." -ForegroundColor Yellow
+Write-Host "       The verify script will list any mismatches and give you" -ForegroundColor Yellow
+Write-Host "       the exact commands to fix them." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "    3. Check DNS dynamic update credentials on $PartnerServer." -ForegroundColor Yellow
+Write-Host "       Open DHCP console > right-click IPv4 > Properties > DNS tab." -ForegroundColor Yellow
+Write-Host "       Click Advanced > Credentials. If the source server uses a" -ForegroundColor Yellow
+Write-Host "       service account for DNS updates, configure the SAME account" -ForegroundColor Yellow
+Write-Host "       on the partner. If you skip this, the new server will not" -ForegroundColor Yellow
+Write-Host "       have permission to update existing DNS records, causing" -ForegroundColor Yellow
+Write-Host "       stale DNS entries for DHCP clients." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  PHASE 2: UPDATE IP HELPERS (do this during the soak period)" -ForegroundColor White
+Write-Host ""
+Write-Host "    4. On your firewalls/routers/L3 switches, ADD $PartnerServer" -ForegroundColor Yellow
+Write-Host "       as a SECOND IP helper alongside the existing $SourceServer." -ForegroundColor Yellow
+Write-Host "       Do NOT remove $SourceServer yet." -ForegroundColor Yellow
+Write-Host "       Both servers will receive DHCP requests, but the active" -ForegroundColor Yellow
+Write-Host "       server ($SourceServer) will respond. This gives you a" -ForegroundColor Yellow
+Write-Host "       safety net: if something goes wrong with the new server," -ForegroundColor Yellow
+Write-Host "       the old one is still responding." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "       Also ensure UDP ports 67 and 68 are open from your relay" -ForegroundColor Yellow
+Write-Host "       agents to $PartnerServer. Without these, DHCP requests" -ForegroundColor Yellow
+Write-Host "       will never reach the new server." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "    5. Let both servers run side-by-side for at least 1-2 days." -ForegroundColor Yellow
+Write-Host "       This soak period lets you verify everything is working" -ForegroundColor Yellow
+Write-Host "       and gives leases time to fully synchronise." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  PHASE 3: CUT OVER (when you're confident)" -ForegroundColor White
+Write-Host ""
+Write-Host "    6. IMPORTANT: Break the failover FIRST, then stop the old server." -ForegroundColor Red
+Write-Host "       Run this on the NEW server ($PartnerServer):" -ForegroundColor Yellow
+Write-Host "       Remove-DhcpServerv4Failover -Name `"$FailoverName`"" -ForegroundColor Cyan
+Write-Host "       (Scopes stay on whichever server runs this command.)" -ForegroundColor Yellow
+Write-Host ""
+Write-Host "       DO NOT just stop the DHCP service on $SourceServer without" -ForegroundColor Red
+Write-Host "       breaking failover first. If you do, the new server enters" -ForegroundColor Red
+Write-Host "       'Communication Interrupted' state and will ONLY renew" -ForegroundColor Red
+Write-Host "       existing leases for 1 hour (the MCLT). It will NOT issue" -ForegroundColor Red
+Write-Host "       new leases to new devices until the StateSwitchInterval" -ForegroundColor Red
+Write-Host "       ($StateSwitchInterval) expires and it auto-transitions to" -ForegroundColor Red
+Write-Host "       Partner Down. During that window, any new device joining" -ForegroundColor Red
+Write-Host "       the network gets no IP address." -ForegroundColor Red
+Write-Host ""
+Write-Host "    7. After breaking failover, stop (don't uninstall) the old" -ForegroundColor Yellow
+Write-Host "       DHCP service as a safety measure:" -ForegroundColor Yellow
+Write-Host "       Stop-Service DHCPServer -ComputerName `"$SourceServer`"" -ForegroundColor Cyan
+Write-Host "       Set-Service -Name DHCPServer -StartupType Disabled -ComputerName `"$SourceServer`"" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "    8. Remove $SourceServer from all IP helpers on your" -ForegroundColor Yellow
+Write-Host "       firewalls/routers/L3 switches. $PartnerServer should now" -ForegroundColor Yellow
+Write-Host "       be the only IP helper listed." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "    9. Monitor the new server for a few hours. Renew a few" -ForegroundColor Yellow
+Write-Host "       clients manually (ipconfig /release then /renew) to confirm" -ForegroundColor Yellow
+Write-Host "       they get addresses from $PartnerServer." -ForegroundColor Yellow
+Write-Host ""
+Write-Host "  To force a manual replication sync at any time during the soak period:" -ForegroundColor White
 Write-Host "    Invoke-DhcpServerv4FailoverReplication -ComputerName `"$SourceServer`" -Name `"$FailoverName`"" -ForegroundColor Cyan
 Write-Host ""
