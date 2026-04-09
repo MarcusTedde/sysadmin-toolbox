@@ -87,6 +87,11 @@ function Write-SkipWarn {
     $script:warnCount++
 }
 
+function Write-Info {
+    param([string]$Message)
+    Write-Host "  [INFO]  $Message" -ForegroundColor Gray
+}
+
 function Write-Section {
     param([string]$Message)
     Write-Host ""
@@ -246,42 +251,64 @@ try {
     $sourceScopes = @(Get-DhcpServerv4Scope -ComputerName $SourceServer -ErrorAction Stop)
     $partnerScopes = @(Get-DhcpServerv4Scope -ComputerName $PartnerServer -ErrorAction Stop)
 
-    $sourceScopeIds = $sourceScopes | ForEach-Object { $_.ScopeId.ToString() } | Sort-Object
+    # Separate active and inactive scopes on the source.
+    # Failover only replicates active scopes, so inactive scopes on the source
+    # are expected to be absent from the partner. They should not count as failures.
+    $sourceActiveScopes = @($sourceScopes | Where-Object { $_.State -eq "Active" })
+    $sourceInactiveScopes = @($sourceScopes | Where-Object { $_.State -ne "Active" })
+
+    $sourceActiveScopeIds = $sourceActiveScopes | ForEach-Object { $_.ScopeId.ToString() } | Sort-Object
     $partnerScopeIds = $partnerScopes | ForEach-Object { $_.ScopeId.ToString() } | Sort-Object
 
-    # Check scope count
-    if ($sourceScopes.Count -eq $partnerScopes.Count) {
-        Write-Pass "Scope count matches: $($sourceScopes.Count) on both servers."
-        Add-Report "  PASS: Scope count matches ($($sourceScopes.Count))"
-    }
-    else {
-        Write-Fail "Scope count mismatch: Source=$($sourceScopes.Count)  Partner=$($partnerScopes.Count)"
-        Add-Report "  FAIL: Scope count mismatch (Source=$($sourceScopes.Count), Partner=$($partnerScopes.Count))"
+    # Report inactive scopes as informational (not failures)
+    if ($sourceInactiveScopes.Count -gt 0) {
+        Write-Info "$($sourceInactiveScopes.Count) inactive/disabled scope(s) on source (not included in failover):"
+        foreach ($scope in $sourceInactiveScopes) {
+            Write-Host "    $($scope.ScopeId)  [$($scope.Name)]  State: $($scope.State)" -ForegroundColor Gray
+        }
+        Add-Report "  INFO: $($sourceInactiveScopes.Count) inactive scope(s) on source (skipped, not part of failover)"
+        Write-Host ""
     }
 
-    # Check for scopes on source but missing from partner
-    $missingOnPartner = $sourceScopeIds | Where-Object { $_ -notin $partnerScopeIds }
-    if ($missingOnPartner) {
+    # Check active scope count
+    if ($sourceActiveScopes.Count -eq $partnerScopes.Count) {
+        Write-Pass "Active scope count matches: $($sourceActiveScopes.Count) on source, $($partnerScopes.Count) on partner."
+        Add-Report "  PASS: Active scope count matches ($($sourceActiveScopes.Count))"
+    }
+    else {
+        Write-Fail "Active scope count mismatch: Source=$($sourceActiveScopes.Count) active  Partner=$($partnerScopes.Count)"
+        Add-Report "  FAIL: Active scope count mismatch (Source=$($sourceActiveScopes.Count), Partner=$($partnerScopes.Count))"
+    }
+
+    # Check for active scopes on source but missing from partner
+    $missingOnPartner = @()
+    if ($sourceActiveScopeIds) {
+        $missingOnPartner = @($sourceActiveScopeIds | Where-Object { $_ -notin $partnerScopeIds })
+    }
+    if ($missingOnPartner.Count -gt 0) {
         foreach ($missing in $missingOnPartner) {
-            $scopeName = ($sourceScopes | Where-Object { $_.ScopeId.ToString() -eq $missing }).Name
-            Write-Fail "Scope $missing [$scopeName] exists on source but NOT on partner."
+            $scopeName = ($sourceActiveScopes | Where-Object { $_.ScopeId.ToString() -eq $missing }).Name
+            Write-Fail "Scope $missing [$scopeName] is active on source but NOT on partner."
             Add-Report "  FAIL: Missing on partner: $missing [$scopeName]"
         }
     }
 
     # Check for unexpected scopes on partner that aren't on source
-    $extraOnPartner = $partnerScopeIds | Where-Object { $_ -notin $sourceScopeIds }
-    if ($extraOnPartner) {
+    $extraOnPartner = @()
+    if ($partnerScopeIds) {
+        $extraOnPartner = @($partnerScopeIds | Where-Object { $_ -notin $sourceActiveScopeIds })
+    }
+    if ($extraOnPartner.Count -gt 0) {
         foreach ($extra in $extraOnPartner) {
             $scopeName = ($partnerScopes | Where-Object { $_.ScopeId.ToString() -eq $extra }).Name
-            Write-SkipWarn "Scope $extra [$scopeName] exists on partner but NOT on source (unexpected)."
+            Write-SkipWarn "Scope $extra [$scopeName] exists on partner but NOT active on source (unexpected)."
             Add-Report "  WARN: Extra on partner: $extra [$scopeName]"
         }
     }
 
-    if (-not $missingOnPartner -and -not $extraOnPartner) {
-        Write-Pass "All scope IDs match between source and partner."
-        Add-Report "  PASS: All scope IDs match"
+    if ($missingOnPartner.Count -eq 0 -and $extraOnPartner.Count -eq 0) {
+        Write-Pass "All active scope IDs match between source and partner."
+        Add-Report "  PASS: All active scope IDs match"
     }
 }
 catch {
@@ -299,8 +326,11 @@ Add-Report ""
 Add-Report "PER-SCOPE DETAILED COMPARISON"
 Add-Report ("-" * 40)
 
-# Only compare scopes that exist on both servers
-$commonScopeIds = $sourceScopeIds | Where-Object { $_ -in $partnerScopeIds }
+# Only compare active scopes that exist on both servers
+$commonScopeIds = @()
+if ($sourceActiveScopeIds) {
+    $commonScopeIds = @($sourceActiveScopeIds | Where-Object { $_ -in $partnerScopeIds })
+}
 
 foreach ($scopeIdStr in $commonScopeIds) {
     $scopeId = [System.Net.IPAddress]::Parse($scopeIdStr)
