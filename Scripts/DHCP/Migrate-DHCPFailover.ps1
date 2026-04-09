@@ -26,7 +26,10 @@
     Name for the failover relationship. Defaults to "DHCP-Migration".
 
 .PARAMETER SharedSecret
-    The shared secret password for failover authentication between the two servers.
+    Optional shared secret password for failover authentication between the two servers.
+    If not specified, message authentication is disabled on the failover relationship.
+    This is fine for most environments. Only needed if you want to prevent unauthorised
+    DHCP servers from joining the failover relationship.
 
 .PARAMETER FailoverMode
     Choose HotStandby or LoadBalance. Defaults to HotStandby (recommended for migrations).
@@ -50,10 +53,13 @@
     Skip the backup step if you've already taken one.
 
 .EXAMPLE
+    .\Migrate-DHCPFailover.ps1 -SourceServer "OLD-DC.domain.local" -PartnerServer "NEW-DC.domain.local"
+
+.EXAMPLE
     .\Migrate-DHCPFailover.ps1 -SourceServer "OLD-DC.domain.local" -PartnerServer "NEW-DC.domain.local" -SharedSecret "Str0ngP@ss!"
 
 .EXAMPLE
-    .\Migrate-DHCPFailover.ps1 -SourceServer "OLD-DC" -PartnerServer "NEW-DC" -SharedSecret "Str0ngP@ss!" -FailoverMode LoadBalance
+    .\Migrate-DHCPFailover.ps1 -SourceServer "OLD-DC" -PartnerServer "NEW-DC" -FailoverMode LoadBalance
 
 .NOTES
     Author  : Marcus Tedde
@@ -72,7 +78,6 @@ param(
     [Parameter(Mandatory)]
     [string]$PartnerServer,
 
-    [Parameter(Mandatory)]
     [string]$SharedSecret,
 
     [string]$BackupPath = "C:\DHCPMigration",
@@ -538,11 +543,16 @@ $failoverParams = @{
     ComputerName      = $SourceServer
     PartnerServer     = $PartnerServer
     Name              = $FailoverName
-    SharedSecret      = $SharedSecret
     MaxClientLeadTime = $MaxClientLeadTime
     ScopeId           = $scopeIds
     Force             = $true
     ErrorAction       = "Stop"
+}
+
+# Only add SharedSecret if provided. If omitted, message authentication
+# is disabled on the failover relationship (which is fine for most environments).
+if ($SharedSecret) {
+    $failoverParams["SharedSecret"] = $SharedSecret
 }
 
 # Add mode-specific parameters
