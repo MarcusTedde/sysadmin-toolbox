@@ -1,0 +1,1 @@
+$t=New-Object Net.Sockets.TcpClient('localhost',636);$ssl=New-Object Net.Security.SslStream($t.GetStream(),$false,{$true});$ssl.AuthenticateAsClient('localhost');(New-Object Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate))|Format-List Subject,Issuer,Thumbprint;$ssl.Close();$t.Close()
